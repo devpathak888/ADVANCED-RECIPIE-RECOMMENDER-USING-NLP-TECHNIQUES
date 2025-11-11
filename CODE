@@ -1,0 +1,742 @@
+import os
+import re
+import csv
+import zipfile
+import pandas as pd
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+from datetime import datetime
+from threading import Thread
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+
+# ==========================
+# CONFIGURATION (EDIT PATHS)
+# ==========================
+ZIP_PATH = r"C:\Users\jaint\Downloads\archive (15).zip"   # dataset zip (as provided)
+EXTRACT_DIR = "recipes_dataset"
+FEEDBACK_FILE = "feedback.csv"
+FAVORITES_FILE = "favorites.csv"
+
+# ==========================
+# ENSURE DATA EXISTS
+# ==========================
+if not os.path.exists(EXTRACT_DIR) and os.path.exists(ZIP_PATH):
+    try:
+        with zipfile.ZipFile(ZIP_PATH, "r") as zf:
+            zf.extractall(EXTRACT_DIR)
+    except Exception as e:
+        print(f"Could not extract zip: {e}")
+
+def find_first_csv(path):
+    for root, _, files in os.walk(path):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                return os.path.join(root, f)
+    return None
+
+csv_file = find_first_csv(EXTRACT_DIR) if os.path.exists(EXTRACT_DIR) else None
+if csv_file is None:
+    raise FileNotFoundError(
+        f"No CSV found inside '{EXTRACT_DIR}'. Put your recipes CSV there or change ZIP_PATH and EXTRACT_DIR.")
+
+# ==========================
+# LOAD DATA
+# ==========================
+df = pd.read_csv(csv_file)
+df.dropna(how="all", inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+# Guess columns for display and ingredients
+POSSIBLE_NAME_COLS = ["name", "title", "recipe", "recipe_name", "name_of_recipe"]
+POSSIBLE_ING_COLS = ["ingredients", "ingredient", "ingreds", "ingredients_text", "ingredients_list", "ing"]
+
+def find_col(columns, candidates):
+    for c in list(columns):
+        low = str(c).lower()
+        for cand in candidates:
+            if cand in low:
+                return c
+    return None
+
+TEXT_COL = find_col(df.columns, POSSIBLE_NAME_COLS) or df.columns[0]
+ING_COL = find_col(df.columns, POSSIBLE_ING_COLS)
+if ING_COL is None:
+    df["ingredients_text"] = df[TEXT_COL].astype(str).str.lower()
+    ING_COL = "ingredients_text"
+else:
+    df["ingredients_text"] = df[ING_COL].astype(str).str.lower()
+
+# create a combined text column for TF-IDF (title + ingredients)
+df["clean_text"] = df[TEXT_COL].astype(str).str.lower() + " " + df["ingredients_text"].astype(str)
+
+if df["clean_text"].astype(str).str.strip().eq("").all():
+    raise ValueError("All recipe titles/descriptions are empty. Please check your CSV file.")
+
+# ==========================
+# DIET DETECTION (automatic)
+# ==========================
+NON_VEG_KEYWORDS = ["chicken", "mutton", "beef", "pork", "fish", "egg", "shrimp", "prawn", "meat", "bacon"]
+DAIRY_KEYWORDS = ["milk", "cheese", "butter", "ghee", "cream", "yogurt", "paneer", "curd"]
+GLuten_KEYWORDS = ["wheat", "flour", "gluten", "barley", "rye"]
+
+def detect_diet_type(ingredients_text):
+    t = str(ingredients_text).lower()
+    if any(k in t for k in NON_VEG_KEYWORDS):
+        return "Non-Vegetarian"
+    # vegan: no dairy and no non-veg words -> guess vegan
+    if not any(k in t for k in DAIRY_KEYWORDS) and not any(k in t for k in NON_VEG_KEYWORDS):
+        # but check for obvious plant-only markers like "vegetable", "tofu", "beans"
+        return "Vegan"
+    return "Vegetarian"
+
+# apply detection with try/except
+try:
+    df["diet"] = df["ingredients_text"].apply(detect_diet_type)
+except Exception:
+    df["diet"] = "Vegetarian"
+
+# ==========================
+# TF-IDF MODELS
+# ==========================
+try:
+    tfidf_full = TfidfVectorizer(stop_words="english", max_features=25000)
+    tfidf_matrix_full = tfidf_full.fit_transform(df["clean_text"])
+except Exception as e:
+    raise RuntimeError(f"Failed to build TF-IDF for full text: {e}")
+
+try:
+    tfidf_ing = TfidfVectorizer(stop_words="english", max_features=10000)
+    tfidf_matrix_ing = tfidf_ing.fit_transform(df["ingredients_text"])
+except Exception as e:
+    raise RuntimeError(f"Failed to build TF-IDF for ingredients: {e}")
+
+# ==========================
+# CUISINE DETECTION (heuristic)
+# ==========================
+CUISINE_KEYWORDS = {
+    "indian": ["masala", "cumin", "garam", "paneer", "dal", "roti", "tadka", "coriander", "biryani", "curry", "chaat"],
+    "italian": ["pasta", "parmesan", "mozzarella", "basil", "olive oil", "risotto", "lasagna", "gnocchi", "ricotta"],
+    "chinese": ["soy", "ginger", "garlic", "noodles", "spring", "sesame", "szechuan", "hoisin", "wok", "manchurian"],
+    "mexican": ["tortilla", "jalapeno", "avocado", "salsa", "cilantro", "taco", "enchilada", "quesadilla", "chili"],
+    "american": ["bbq", "burger", "fries", "grill", "ketchup", "brownie", "pancake"],
+    "japanese": ["miso", "sushi", "wasabi", "soy sauce", "mirin", "teriyaki"],
+}
+
+def detect_cuisine(text):
+    t = str(text).lower()
+    scores = {k: 0 for k in CUISINE_KEYWORDS}
+    for cuisine, keys in CUISINE_KEYWORDS.items():
+        for kw in keys:
+            if kw in t:
+                scores[cuisine] += 1
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "other"
+
+df["detected_cuisine"] = df["clean_text"].apply(detect_cuisine)
+
+# ==========================
+# SIMPLE NUTRITION HEURISTIC
+# ==========================
+def analyze_nutrition(ingredients_text):
+    text = str(ingredients_text).lower()
+    calories = fat = protein = carbs = 0
+    if re.search(r"(sugar|honey|chocolate|syrup)", text):
+        calories += 150; carbs += 20
+    if re.search(r"(butter|oil|ghee|cream|mayo)", text):
+        fat += 10; calories += 200
+    if re.search(r"(chicken|paneer|tofu|egg|fish|lentil|beans|milk|yogurt|cheese)", text):
+        protein += 15; calories += 120
+    if re.search(r"(rice|flour|bread|pasta|potato|corn|oats|noodles|tortilla)", text):
+        carbs += 25; calories += 160
+    if re.search(r"(nuts|almond|walnut|peanut)", text):
+        fat += 12; protein += 5; calories += 100
+    calories = round(calories + 100, 2)  # baseline
+    return {"Protein": protein, "Carbs": carbs, "Fat": fat, "Calories": calories}
+
+# ==========================
+# FILES: feedback & favorites (create if missing)
+# ==========================
+if not os.path.exists(FEEDBACK_FILE):
+    with open(FEEDBACK_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "query", "recipe", "rating", "feedback"])
+
+if not os.path.exists(FAVORITES_FILE):
+    with open(FAVORITES_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "recipe"])
+
+# ==========================
+# TKINTER UI SETUP
+# ==========================
+root = tk.Tk()
+root.title("Advanced Recipe Recommender - Chat + Diet")
+root.geometry("1250x820")
+BG_COLOR = "#ffe6ee"
+root.config(bg=BG_COLOR)
+FONT_MAIN = ("Times New Roman", 20)
+FONT_SMALL = ("Times New Roman", 12)
+
+style = ttk.Style()
+try:
+    style.theme_use("clam")
+except Exception:
+    pass
+style.configure("TLabel", background=BG_COLOR, font=FONT_SMALL)
+style.configure("TButton", font=("Segoe UI", 11, "bold"), padding=6)
+style.configure("TEntry", font=FONT_SMALL)
+
+title_lbl = tk.Label(root, text="Advanced Recipe Recommender", bg="#ffdbe6",
+                     font=("Times New Roman", 26, "bold"), padx=10, pady=8)
+title_lbl.pack(fill="x", pady=(8, 6))
+
+main_frame = tk.Frame(root, bg=BG_COLOR)
+main_frame.pack(fill="both", expand=True, padx=12, pady=8)
+
+left_col = tk.Frame(main_frame, bg=BG_COLOR)
+left_col.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+right_col = tk.Frame(main_frame, bg=BG_COLOR)
+right_col.pack(side="right", fill="both", expand=True, padx=(8, 0))
+
+# --------------------------
+# SEARCH BOX (left top)
+# --------------------------
+search_frame = tk.LabelFrame(left_col, text="Search / Ingredients", bg=BG_COLOR, font=FONT_SMALL, padx=8, pady=6)
+search_frame.pack(fill="x", pady=6)
+
+tk.Label(search_frame, text="Enter ingredient(s) or keywords:", bg=BG_COLOR, font=FONT_SMALL).grid(row=0, column=0, sticky="w")
+entry_search = ttk.Entry(search_frame, width=48)
+entry_search.grid(row=0, column=1, padx=8, sticky="w")
+btn_search = ttk.Button(search_frame, text="Search")
+btn_search.grid(row=0, column=2, padx=6)
+
+# Cuisine filter
+tk.Label(search_frame, text="Cuisine filter:", bg=BG_COLOR, font=FONT_SMALL).grid(row=1, column=0, sticky="w", pady=(8, 0))
+cuisine_var = tk.StringVar(value="any")
+cuisines = ["any"] + sorted(list({c for c in df["detected_cuisine"].unique() if c}))
+cuisine_cb = ttk.Combobox(search_frame, values=cuisines, textvariable=cuisine_var, state="readonly", width=20)
+cuisine_cb.grid(row=1, column=1, sticky="w", pady=(8, 0))
+
+# Diet filter
+tk.Label(search_frame, text="Diet:", bg=BG_COLOR, font=FONT_SMALL).grid(row=2, column=0, sticky="w", pady=(8, 0))
+diet_var = tk.StringVar(value="All")
+diet_options = ["All", "Vegetarian", "Non-Vegetarian", "Vegan"]
+diet_cb = ttk.Combobox(search_frame, values=diet_options, textvariable=diet_var, state="readonly", width=20)
+diet_cb.grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+# Max calories filter
+tk.Label(search_frame, text="Max Calories (approx):", bg=BG_COLOR, font=FONT_SMALL).grid(row=1, column=2, sticky="w", pady=(8, 0))
+cal_var = tk.StringVar(value="")
+cal_entry = ttk.Entry(search_frame, textvariable=cal_var, width=10)
+cal_entry.grid(row=1, column=3, sticky="w", padx=6, pady=(8, 0))
+
+# --------------------------
+# RESULTS LIST
+# --------------------------
+results_frame = tk.LabelFrame(left_col, text="Results", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+results_frame.pack(fill="both", expand=True, pady=6)
+
+results_list = tk.Listbox(results_frame, font=("Times New Roman", 12))
+results_list.pack(side="left", fill="both", expand=True)
+results_scroll = ttk.Scrollbar(results_frame, command=results_list.yview)
+results_scroll.pack(side="right", fill="y")
+results_list.config(yscrollcommand=results_scroll.set)
+
+# --------------------------
+# DETAILS + ACTIONS
+# --------------------------
+details_frame = tk.LabelFrame(left_col, text="Recipe Details", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+details_frame.pack(fill="both", expand=True, pady=6)
+
+details_text = scrolledtext.ScrolledText(details_frame, height=12, font=("Times New Roman", 12))
+details_text.pack(fill="both", expand=True)
+
+actions_frame = tk.Frame(left_col, bg=BG_COLOR)
+actions_frame.pack(fill="x", pady=6)
+
+btn_add_fav = ttk.Button(actions_frame, text="Add to Favorites")
+btn_add_fav.pack(side="left", padx=6)
+btn_remove_fav = ttk.Button(actions_frame, text="Remove from Favorites")
+btn_remove_fav.pack(side="left", padx=6)
+btn_similar = ttk.Button(actions_frame, text="Show Similar Recipes")
+btn_similar.pack(side="left", padx=6)
+
+# --------------------------
+# RIGHT SIDE: Chat, Charts, Favorites, Personalized, Feedback
+# --------------------------
+chat_frame = tk.LabelFrame(right_col, text="Recipe Chat Assistant", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+chat_frame.pack(fill="both", expand=False, pady=6)
+
+tk.Label(chat_frame, text="Ask me (e.g. 'I have rice and paneer', 'Vegetarian high protein'):", bg=BG_COLOR, font=FONT_SMALL).pack(anchor="w")
+chat_entry = ttk.Entry(chat_frame, width=50)
+chat_entry.pack(side="left", padx=(4,6), pady=6)
+btn_chat = ttk.Button(chat_frame, text="Ask")
+btn_chat.pack(side="left", padx=6, pady=6)
+chat_response = scrolledtext.ScrolledText(chat_frame, height=6, font=("Times New Roman", 12))
+chat_response.pack(fill="both", expand=True, pady=(6,0))
+
+chart_frame = tk.LabelFrame(right_col, text="Charts", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+chart_frame.pack(fill="both", expand=True, pady=6)
+chart_canvas_container = tk.Frame(chart_frame, bg=BG_COLOR)
+chart_canvas_container.pack(fill="both", expand=True)
+
+favorites_frame = tk.LabelFrame(right_col, text="Favorites", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+favorites_frame.pack(fill="both", expand=True, pady=6)
+
+fav_list = tk.Listbox(favorites_frame, font=("Times New Roman", 12), height=8)
+fav_list.pack(side="left", fill="both", expand=True)
+fav_scroll = ttk.Scrollbar(favorites_frame, command=fav_list.yview)
+fav_scroll.pack(side="right", fill="y")
+fav_list.config(yscrollcommand=fav_scroll.set)
+btn_load_favs = ttk.Button(favorites_frame, text="Load Favorites")
+btn_load_favs.pack(side="left", padx=6)
+
+personal_frame = tk.LabelFrame(right_col, text="Personalized Recommendations", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+personal_frame.pack(fill="both", expand=True, pady=6)
+
+pers_list = tk.Listbox(personal_frame, font=("Times New Roman", 12), height=8)
+pers_list.pack(side="left", fill="both", expand=True)
+pers_scroll = ttk.Scrollbar(personal_frame, command=pers_list.yview)
+pers_scroll.pack(side="right", fill="y")
+pers_list.config(yscrollcommand=pers_scroll.set)
+btn_generate_personal = ttk.Button(personal_frame, text="Generate from Favorites")
+btn_generate_personal.pack(side="left", padx=6)
+
+feedback_frame = tk.LabelFrame(right_col, text="Feedback", bg=BG_COLOR, font=FONT_SMALL, padx=6, pady=6)
+feedback_frame.pack(fill="both", expand=True, pady=6)
+
+tk.Label(feedback_frame, text="Rating (1-5):", bg=BG_COLOR, font=FONT_SMALL).grid(row=0, column=0, sticky="w")
+rating_var = tk.IntVar(value=0)
+for i in range(1, 6):
+    tk.Radiobutton(feedback_frame, text=str(i), variable=rating_var, value=i, bg=BG_COLOR).grid(row=0, column=i)
+
+tk.Label(feedback_frame, text="Feedback:", bg=BG_COLOR, font=FONT_SMALL).grid(row=1, column=0, sticky="nw", pady=(6, 0))
+feedback_text = tk.Text(feedback_frame, width=36, height=4, font=("Times New Roman", 12))
+feedback_text.grid(row=1, column=1, columnspan=5, pady=(6, 0), padx=4)
+btn_submit_feedback = ttk.Button(feedback_frame, text="Submit Feedback")
+btn_submit_feedback.grid(row=2, column=1, pady=8)
+
+# ==========================
+# STATE
+# ==========================
+top_indices = []   # indices of current results
+current_canvas = None
+
+# ==========================
+# CHART HELPERS
+# ==========================
+def clear_chart_area():
+    global current_canvas
+    for w in chart_canvas_container.winfo_children():
+        w.destroy()
+    current_canvas = None
+
+def draw_nutrition_chart(nut_dict, title="Nutrition (est)"):
+    clear_chart_area()
+    fig, ax = plt.subplots(figsize=(4.5, 3))
+    labels = ["Protein", "Carbs", "Fat"]
+    vals = [nut_dict.get(k, 0) for k in labels]
+    ax.bar(labels, vals)
+    ax.set_title(title)
+    fig.tight_layout()
+    canvas = FigureCanvasTkAgg(fig, master=chart_canvas_container)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+    return canvas
+
+def draw_similarity_chart(vals, labels, title="Similarity"):
+    clear_chart_area()
+    fig, ax = plt.subplots(figsize=(4.5, 3))
+    ax.bar(labels, vals)
+    ax.set_title(title)
+    fig.tight_layout()
+    canvas = FigureCanvasTkAgg(fig, master=chart_canvas_container)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+    return canvas
+
+# ==========================
+# CORE RECOMMENDATION LOGIC
+# ==========================
+def recommend(query, topk=10, by_ingredients=False, cuisine_filter="any", cal_max=None, diet_filter="All"):
+    if not isinstance(query, str) or not query.strip():
+        return []
+    if by_ingredients:
+        qv = tfidf_ing.transform([query])
+        sims = cosine_similarity(qv, tfidf_matrix_ing).flatten()
+    else:
+        qv = tfidf_full.transform([query])
+        sims = cosine_similarity(qv, tfidf_matrix_full).flatten()
+
+    idxs = np.argsort(sims)[::-1]
+    results = []
+    for i in idxs:
+        if len(results) >= topk:
+            break
+        if sims[i] <= 0:
+            continue
+        if cuisine_filter and cuisine_filter != "any":
+            if df.loc[i, "detected_cuisine"] != cuisine_filter:
+                continue
+        if diet_filter and diet_filter != "All":
+            if df.loc[i, "diet"] != diet_filter:
+                continue
+        if cal_max is not None:
+            nut = analyze_nutrition(df.loc[i, "ingredients_text"])
+            if nut.get("Calories", 0) > cal_max:
+                continue
+        results.append((i, float(sims[i])))
+    return results
+
+def on_search_clicked():
+    global top_indices
+    q = entry_search.get().strip().lower()
+    if not q:
+        messagebox.showwarning("Input required", "Please enter ingredient(s) or a keyword to search.")
+        return
+    by_ing = "," in q or (" " in q and len(q.split()) <= 3)
+    cuisine = cuisine_var.get()
+    diet_sel = diet_var.get()
+    cal_max = None
+    if cal_var.get().strip().isdigit():
+        cal_max = float(cal_var.get().strip())
+
+    def worker():
+        global top_indices
+        results = recommend(q, topk=12, by_ingredients=by_ing, cuisine_filter=cuisine, cal_max=cal_max, diet_filter=diet_sel)
+        top_indices = [r[0] for r in results]
+        sims = [r[1] for r in results]
+        def ui_update():
+            results_list.delete(0, tk.END)
+            for idx, s in results:
+                name = df.loc[idx, TEXT_COL]
+                nut = analyze_nutrition(df.loc[idx, "ingredients_text"])
+                results_list.insert(tk.END, f"{name}  [{df.loc[idx,'detected_cuisine']}]  (cal~{nut['Calories']})  [{s:.2f}]")
+            if sims:
+                draw_similarity_chart(sims, [f"R{i+1}" for i in range(len(sims))], "Top Similarity")
+            else:
+                clear_chart_area()
+        root.after(0, ui_update)
+
+    Thread(target=worker, daemon=True).start()
+
+btn_search.config(command=on_search_clicked)
+
+# ==========================
+# SHOW DETAILS
+# ==========================
+def show_details(event=None, source_list=None):
+    lb = source_list or results_list
+    sel = lb.curselection()
+    if not sel:
+        return
+    pos = sel[0]
+    if lb is results_list:
+        if pos >= len(top_indices):
+            return
+        idx = top_indices[pos]
+    elif lb is fav_list:
+        try:
+            with open(FAVORITES_FILE, newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            if pos + 1 >= len(rows):
+                return
+            name = rows[pos+1][1]
+            found = df.index[df[TEXT_COL] == name].tolist()
+            if not found:
+                messagebox.showinfo("Missing", "Recipe not found in dataset.")
+                return
+            idx = found[0]
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load favorite: {e}")
+            return
+    else:  # pers_list
+        text = lb.get(pos)
+        name = text.split(" [")[0].strip()
+        found = df.index[df[TEXT_COL] == name].tolist()
+        if not found:
+            messagebox.showinfo("Missing", "Recipe not found in dataset.")
+            return
+        idx = found[0]
+
+    rec = df.loc[idx]
+    details_text.delete("1.0", tk.END)
+    details_text.insert(tk.END, f"Recipe: {rec[TEXT_COL]}\n\n")
+    details_text.insert(tk.END, f"Cuisine (detected): {rec['detected_cuisine']}\n\n")
+    details_text.insert(tk.END, f"Diet: {rec.get('diet','Unknown')}\n\n")
+    details_text.insert(tk.END, "Ingredients:\n")
+    details_text.insert(tk.END, f"{rec.get(ING_COL, rec['ingredients_text'])}\n\n")
+    nut = analyze_nutrition(rec["ingredients_text"])
+    details_text.insert(tk.END, "Nutrition (est):\n")
+    for k, v in nut.items():
+        details_text.insert(tk.END, f"{k}: {v}\n")
+    draw_nutrition_chart(nut, title=f"Nutrition for {rec[TEXT_COL]}")
+
+results_list.bind("<<ListboxSelect>>", show_details)
+fav_list.bind("<<ListboxSelect>>", lambda e: show_details(e, source_list=fav_list))
+pers_list.bind("<<ListboxSelect>>", lambda e: show_details(e, source_list=pers_list))
+
+# ==========================
+# FAVORITES MANAGEMENT
+# ==========================
+def load_favorites():
+    fav_list.delete(0, tk.END)
+    try:
+        with open(FAVORITES_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        if len(rows) <= 1:
+            return
+        for r in rows[1:]:
+            if len(r) >= 2:
+                fav_list.insert(tk.END, r[1])
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not load favorites: {e}")
+
+def add_to_favorites():
+    sel = results_list.curselection()
+    if not sel:
+        messagebox.showwarning("Select", "Select a recipe from results to add to favorites.")
+        return
+    idx = top_indices[sel[0]]
+    name = df.loc[idx, TEXT_COL]
+    try:
+        with open(FAVORITES_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        existing = [r[1] for r in rows[1:]] if len(rows) > 1 else []
+    except Exception:
+        existing = []
+    if name in existing:
+        messagebox.showinfo("Exists", "Recipe already in favorites.")
+        return
+    try:
+        with open(FAVORITES_FILE, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([datetime.now(), name])
+        load_favorites()
+        messagebox.showinfo("Added", f"'{name}' added to favorites.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not add favorite: {e}")
+
+def remove_from_favorites():
+    sel = fav_list.curselection()
+    if not sel:
+        messagebox.showwarning("Select", "Select a favorite to remove.")
+        return
+    pos = sel[0]
+    try:
+        with open(FAVORITES_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        if pos + 1 >= len(rows):
+            messagebox.showerror("Error", "Invalid favorite selection.")
+            return
+        rows.pop(pos + 1)
+        with open(FAVORITES_FILE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
+        load_favorites()
+        messagebox.showinfo("Removed", "Favorite removed.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not remove favorite: {e}")
+
+btn_load_favs.config(command=load_favorites)
+btn_add_fav.config(command=add_to_favorites)
+btn_remove_fav.config(command=remove_from_favorites)
+
+# ==========================
+# PERSONALIZED RECOMMENDATIONS
+# ==========================
+def generate_personalized():
+    try:
+        with open(FAVORITES_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        fav_names = [r[1] for r in rows[1:]] if len(rows) > 1 else []
+    except Exception:
+        fav_names = []
+    if not fav_names:
+        messagebox.showinfo("No favorites", "Add favorites first to generate personalized recommendations.")
+        return
+    fav_idx = []
+    for name in fav_names:
+        found = df.index[df[TEXT_COL] == name].tolist()
+        if found:
+            fav_idx.append(found[0])
+    if not fav_idx:
+        messagebox.showinfo("No matches", "Favorite recipes not found in dataset.")
+        return
+    fav_vecs = tfidf_matrix_full[fav_idx]
+    mean_vec = fav_vecs.mean(axis=0)
+    sims = cosine_similarity(mean_vec, tfidf_matrix_full).flatten()
+    indices = np.argsort(sims)[::-1]
+    recs = []
+    for i in indices:
+        if len(recs) >= 12:
+            break
+        if i in fav_idx:
+            continue
+        if sims[i] <= 0:
+            continue
+        recs.append((i, float(sims[i])))
+    pers_list.delete(0, tk.END)
+    for idx, s in recs:
+        name = df.loc[idx, TEXT_COL]
+        nut = analyze_nutrition(df.loc[idx, "ingredients_text"])
+        pers_list.insert(tk.END, f"{name} [{df.loc[idx,'detected_cuisine']}] (cal~{nut['Calories']}) [{s:.2f}]")
+
+btn_generate_personal.config(command=generate_personalized)
+
+# ==========================
+# SIMILAR RECIPES (for selected result)
+# ==========================
+def show_similar_for_selected():
+    sel = results_list.curselection()
+    if not sel:
+        messagebox.showwarning("Select", "Select a recipe first.")
+        return
+    idx = top_indices[sel[0]]
+    vec = tfidf_matrix_full[idx]
+    sims = cosine_similarity(vec, tfidf_matrix_full).flatten()
+    top = np.argsort(sims)[::-1][1:9]
+    results_list.delete(0, tk.END)
+    vals = []
+    labels = []
+    for t in top:
+        vals.append(sims[t])
+        labels.append(df.loc[t, TEXT_COL])
+        nut = analyze_nutrition(df.loc[t, "ingredients_text"])
+        results_list.insert(tk.END, f"{df.loc[t, TEXT_COL]} [{df.loc[t,'detected_cuisine']}] (cal~{nut['Calories']}) [{sims[t]:.2f}]")
+    if vals:
+        draw_similarity_chart(vals, [f"S{i+1}" for i in range(len(vals))], title="Similar Recipes")
+
+btn_similar.config(command=show_similar_for_selected)
+
+# ==========================
+# FEEDBACK SUBMISSION
+# ==========================
+def submit_feedback():
+    sel = results_list.curselection()
+    if not sel:
+        messagebox.showwarning("Select", "Select a recipe to give feedback.")
+        return
+    idx = top_indices[sel[0]]
+    name = df.loc[idx, TEXT_COL]
+    rating = rating_var.get()
+    txt = feedback_text.get("1.0", tk.END).strip()
+    if rating == 0 or not txt:
+        messagebox.showwarning("Incomplete", "Provide both a rating and feedback text.")
+        return
+    try:
+        with open(FEEDBACK_FILE, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([datetime.now(), entry_search.get().strip(), name, rating, txt])
+        feedback_text.delete("1.0", tk.END)
+        rating_var.set(0)
+        messagebox.showinfo("Thanks", "Feedback saved. Thank you!")
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not save feedback: {e}")
+
+btn_submit_feedback.config(command=submit_feedback)
+
+# ==========================
+# RECIPE CHAT ASSISTANT
+# ==========================
+def parse_chat_preferences(query):
+    q = query.lower()
+    # parse diet hints
+    diet_hint = None
+    if any(w in q for w in ["vegetarian", "veg", "only veg"]):
+        diet_hint = "Vegetarian"
+    elif any(w in q for w in ["vegan", "no dairy", "plant-based"]):
+        diet_hint = "Vegan"
+    elif any(w in q for w in ["non-veg", "non veg", "chicken", "meat", "fish", "egg"]):
+        diet_hint = "Non-Vegetarian"
+    # parse cuisine hint
+    cuisine_hint = None
+    for c in CUISINE_KEYWORDS:
+        if c in q:
+            cuisine_hint = c
+            break
+    # parse calorie hint (e.g., "low calorie", "under 400")
+    cal_hint = None
+    m = re.search(r"under\s*(\d{2,4})", q)
+    if m:
+        cal_hint = float(m.group(1))
+    elif "low calorie" in q or "lowcal" in q or "light" in q:
+        cal_hint = 400.0
+    return diet_hint, cuisine_hint, cal_hint
+
+def chat_assistant_action():
+    query = chat_entry.get().strip()
+    if not query:
+        messagebox.showwarning("Input required", "Type your question or ingredients.")
+        return
+    chat_response.delete("1.0", tk.END)
+    chat_response.insert(tk.END, "Thinking...\n")
+    def worker():
+        diet_hint, cuisine_hint, cal_hint = parse_chat_preferences(query)
+        # choose by ingredients if user lists commas or short phrase
+        by_ing = "," in query or (" " in query and len(query.split()) <= 4)
+        # initial recommend from TF-IDF (use full)
+        results = recommend(query, topk=8, by_ingredients=by_ing,
+                            cuisine_filter=(cuisine_hint or "any"),
+                            cal_max=cal_hint,
+                            diet_filter=(diet_hint or "All"))
+        # If not enough results, relax filters
+        if len(results) < 3:
+            results = recommend(query, topk=8, by_ingredients=False, cuisine_filter="any", cal_max=None, diet_filter=(diet_hint or "All"))
+        if len(results) < 3:
+            results = recommend(query, topk=8, by_ingredients=True, cuisine_filter="any", cal_max=None, diet_filter="All")
+        # prepare response
+        if not results:
+            text = "Sorry — I couldn't find matching recipes. Try different ingredients or remove strict filters."
+        else:
+            lines = []
+            lines.append("Here are some suggestions based on your query:\n")
+            for rank, (idx, score) in enumerate(results[:5], start=1):
+                rec = df.loc[idx]
+                nut = analyze_nutrition(rec["ingredients_text"])
+                lines.append(f"{rank}. {rec[TEXT_COL]}  [{rec['detected_cuisine']}]  Diet: {rec.get('diet','Unknown')}  (cal~{nut['Calories']})  [score {score:.2f}]")
+                # include brief reason: common ingredients overlap (top shared tokens)
+                # compute ingredient overlap
+                try:
+                    ing_tokens = set(re.findall(r"\w+", rec["ingredients_text"].lower()))
+                    q_tokens = set(re.findall(r"\w+", query.lower()))
+                    common = ing_tokens.intersection(q_tokens)
+                    if common:
+                        sample = ", ".join(list(common)[:5])
+                        lines.append(f"   → Shares ingredients/keywords: {sample}")
+                except Exception:
+                    pass
+                lines.append("")  # blank line between items
+            text = "\n".join(lines)
+        root.after(0, lambda: chat_response.replace("1.0", "end", text))
+
+    Thread(target=worker, daemon=True).start()
+
+btn_chat.config(command=chat_assistant_action)
+
+# ==========================
+# DOUBLE-CLICK HELPERS
+# ==========================
+def on_results_double_click(e):
+    show_details()
+
+def on_favs_double_click(e):
+    show_details(source_list=fav_list)
+
+def on_pers_double_click(e):
+    show_details(source_list=pers_list)
+
+results_list.bind("<Double-Button-1>", on_results_double_click)
+fav_list.bind("<Double-Button-1>", on_favs_double_click)
+pers_list.bind("<Double-Button-1>", on_pers_double_click)
+
+# ==========================
+# INITIAL LOAD
+# ==========================
+load_favorites()
+
+# Start the Tkinter main loop
+if __name__ == '__main__':
+    root.mainloop()
